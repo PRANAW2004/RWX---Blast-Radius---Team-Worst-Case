@@ -302,6 +302,58 @@ def statement_ranges(old_fn, new_fn):
     return ranges
 
 
+def changed_scalar_attribute(old, new):
+    """Find a single class assignment whose scalar value alone was replaced."""
+    if len(old.body) != len(new.body):
+        return None
+    for a, b in zip(old.body, new.body):
+        if not (isinstance(a, ast.Assign) and isinstance(b, ast.Assign)
+                and len(a.targets) == 1 and isinstance(a.targets[0], ast.Name)):
+            continue
+        try:
+            x, y = ast.literal_eval(a.value), ast.literal_eval(b.value)
+        except (ValueError, TypeError):
+            continue
+        if type(x) not in (bool, int, float, str) or type(x) is not type(y) or x == y:
+            continue
+        saved = b.value
+        try:
+            b.value = a.value
+            if own_shape(old) == own_shape(new):
+                return a.targets[0].id
+        finally:
+            b.value = saved
+    return None
+
+
+def comparison_equivalent(old, new, sites, categories):
+    """Recognize a single identity/equality substitution with unchanged operands."""
+    old_tests = [n for n in ast.walk(old) if isinstance(n, ast.Compare)]
+    new_tests = [n for n in ast.walk(new) if isinstance(n, ast.Compare)]
+    if len(old_tests) != len(new_tests):
+        return False
+    pairs = {frozenset((ast.Is, ast.Eq)), frozenset((ast.IsNot, ast.NotEq))}
+    for before, after in zip(old_tests, new_tests):
+        if len(before.ops) != 1 or len(after.ops) != 1:
+            continue
+        if frozenset((type(before.ops[0]), type(after.ops[0]))) not in pairs:
+            continue
+        types = sites.get(f"{before.lineno},{before.col_offset}")
+        if types is None:
+            return False
+        left, right = types
+        tags = {categories[t] for t in left + right if t != "None"}
+        if len(tags) > 1:
+            return False
+        saved = after.ops
+        try:
+            after.ops = before.ops
+            return ast.dump(old) == ast.dump(new)
+        finally:
+            after.ops = saved
+    return False
+
+
 def function_traits(fn):
     """Compile-time facts about a function that a local edit can change globally."""
     stored, flags = set(), set()
@@ -429,6 +481,18 @@ def stmt_shape_list(block):
 
 class Selector:
     def __init__(self, data):
+        self.sites = {}
+        self.categories = {}
+        self.attribute_users = {}
+        try:
+            with open(os.path.join(HERE, "type-map.json"), encoding="utf8") as f:
+                type_map = json.load(f)
+            self.sites = type_map["sites"]
+            self.categories = type_map["types"]
+            with open(os.path.join(HERE, "attributes.json"), encoding="utf8") as f:
+                self.attribute_users = {k: int(v, 16) for k, v in json.load(f).items()}
+        except FileNotFoundError:
+            pass  # Older installations can still use the original coverage map.
         self.count = data["count"]
         self.ms = data["ms"]
         self.sets = data["sets"]
@@ -470,18 +534,18 @@ class Selector:
 
     def select(self, patch_text):
         bits = 0
-        for change in parse_patch(patch_text):
+        changes = parse_patch(patch_text)
+        for change in changes:
             try:
-                bits |= self.select_change(change)
+                bits |= self.select_change(change, len(changes) == 1)
             except Exception as error:  # never crash: fall back to everything the file touches
                 log(f"fallback on {change.get('old') or change.get('new')}: {error!r}")
                 path = change.get("old") or change.get("new") or ""
-                bits |= self.importers(path) | self.readers(path) | self.tests_in(path)
-                if not bits:
-                    bits = self.all
+                affected = self.importers(path) | self.readers(path) | self.tests_in(path)
+                bits |= affected or self.all
         return bits
 
-    def select_change(self, change):
+    def select_change(self, change, single_file=True):
         old_path, new_path = change["old"], change["new"]
         bits = 0
         for path in {old_path, new_path} - {None}:
@@ -515,7 +579,21 @@ class Selector:
             return bits | self.importers(old_path) | self.tests_in(old_path)
 
         old_scopes, new_scopes = Scopes(old_tree), Scopes(new_tree)
-        for scope in changed_scopes(old_scopes, new_scopes, removed, added):
+        changed = changed_scopes(old_scopes, new_scopes, removed, added)
+        if single_file and old_path == new_path and len(changed) == 1:
+            scope = next(iter(changed))
+            old = old_scopes.nodes[scope]
+            new = new_scopes.nodes.get(scope)
+            if (isinstance(old, (ast.FunctionDef, ast.AsyncFunctionDef)) and isinstance(new, type(old))
+                    and old_path in self.sites
+                    and comparison_equivalent(old, new, self.sites[old_path], self.categories)):
+                return bits
+            if isinstance(old, ast.ClassDef) and isinstance(new, ast.ClassDef):
+                attr = changed_scalar_attribute(old, new)
+                if attr in self.attribute_users:
+                    users = self.scope_users(old_path, old_scopes, scope, new_scopes)
+                    return bits | (users & self.attribute_users[attr])
+        for scope in changed:
             bits |= self.scope_users(old_path, old_scopes, scope, new_scopes)
         if new_path != old_path:  # renamed module: everything importing the old name
             bits |= self.importers(old_path)
@@ -613,10 +691,14 @@ def schedule(numbers, ms):
     if not numbers:
         return []
     ordered = sorted(numbers, key=lambda n: (-ms[n], n))
+    total_ms = sum(ms[n] for n in ordered)
     best, best_cost = None, None
     for count in range(1, MAX_WORKERS + 1):
         if count > len(ordered):
             break
+        lower_bound = max(ms[ordered[0]], (total_ms + count - 1) // count)
+        if best_cost is not None and lower_bound + WORKER_MS * count >= best_cost:
+            continue
         loads = [0] * count
         workers = [[] for _ in range(count)]
         for n in ordered:

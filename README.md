@@ -1,6 +1,16 @@
-# Blast Radius starter
+# Team Worst Case — Blast Radius
 
-A working submission for the Blast Radius track. It runs every test on every commit, so it never misses a failure and scores badly. Your job is to run less without missing.
+The selector uses the pinned SQLGlot checkout and per-test coverage to estimate which tests a change can affect. It narrows two cases further when a patch changes one scope in one file.
+
+* For an identity/equality substitution, the selector checks inferred operand types and verifies that restoring the original operator reproduces the original function syntax tree. Supported types include booleans, conventional enum members, and project classes that inherit identity equality. Python permits values outside their annotations, so this is a static prediction.
+* For a changed scalar class setting, the selector intersects the original class candidates with coverage of statements that read the attribute name. String references disable this refinement for that name. Computed attribute names can still escape static analysis.
+
+The image ships both indexes. To regenerate them, use Python 3.13 with the locked dependencies, set `ENTRY` to the absolute path of this repository and `SQLGLOT` to the absolute path of the pinned checkout, then run
+
+```sh
+(cd "$SQLGLOT" && python "$ENTRY/mapper/build_type_map.py" "$ENTRY/type-map.json")
+python "$ENTRY/mapper/build_attribute_map.py" "$SQLGLOT" "$ENTRY/map.pkl.gz" "$ENTRY/attributes.json"
+```
 
 ## The problem
 
