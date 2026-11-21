@@ -1,0 +1,19 @@
+# Builds the coverage map in the exact image the commits were labeled in
+# (same Python, same SQLite, same packages). Run with `make map` (~30-45 min).
+FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
+
+ARG SQLGLOT_COMMIT=eb11aec4be8cb2122afe713a4816662c3f0fb2fa
+RUN python -c "import io, tarfile, urllib.request; \
+data = urllib.request.urlopen('https://codeload.github.com/tobymao/sqlglot/tar.gz/${SQLGLOT_COMMIT}', timeout=120).read(); \
+tar = tarfile.open(fileobj=io.BytesIO(data)); \
+members = [m for m in tar.getmembers() if m.isfile() and '/' in m.name]; \
+[setattr(m, 'name', m.name.split('/', 1)[1]) for m in members]; \
+tar.extractall('/src', members=members, filter='data')"
+
+COPY requirements.lock /tmp/requirements.lock
+RUN pip install --no-cache-dir -r /tmp/requirements.lock coverage==7.10.7
+
+COPY mapper/run_isolated.py mapper/build_map.py /mapper/
+ENV SKIP_INTEGRATION=0
+# /data/tests.json and /out are mounted by `make map`.
+CMD ["sh", "-c", "python /mapper/run_isolated.py /src /data/tests.json /work/iso $(nproc) && python /mapper/build_map.py /src /data/tests.json /work/iso /out/map.pkl.gz"]

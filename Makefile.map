@@ -1,0 +1,9 @@
+# Append these targets to the kit's Makefile (or: make -f Makefile.map map).
+# Builds map.pkl.gz in the repository root from the pinned commit.
+.PHONY: map
+map:
+	docker build --platform linux/amd64 -f mapper/Dockerfile.map -t blast-map .
+	docker run --rm --platform linux/amd64 \
+		--volume $(CURDIR)/sample/tests.json:/data/tests.json:ro \
+		--volume $(CURDIR):/out blast-map
+	ls -la map.pkl.gz
