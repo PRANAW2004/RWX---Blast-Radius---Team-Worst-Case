@@ -19,7 +19,7 @@ tar.extractall('/app/src', members=members, filter='data')" \
 
 # The coverage map built from the pinned commit (mapper/ shows how), unpacked
 # here so the run does not pay to decompress it.
-COPY map.pkl.gz type-map.json attributes.json selector.py run.py /app/
+COPY map.pkl.gz selector.py run.py /app/
 RUN python -c "import gzip, shutil; shutil.copyfileobj(gzip.open('/app/map.pkl.gz'), open('/app/map.pkl', 'wb'))" \
  && rm /app/map.pkl.gz \
  && python -m compileall -q /app/selector.py \

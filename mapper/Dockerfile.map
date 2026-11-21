@@ -13,7 +13,7 @@ tar.extractall('/src', members=members, filter='data')"
 COPY requirements.lock /tmp/requirements.lock
 RUN pip install --no-cache-dir -r /tmp/requirements.lock coverage==7.10.7
 
-COPY mapper/run_isolated.py mapper/build_map.py /mapper/
+COPY mapper/run_isolated.py mapper/run_probes.py mapper/build_map.py mapper/build_refs.py /mapper/
 ENV SKIP_INTEGRATION=0
 # /data/tests.json and /out are mounted by `make map`.
-CMD ["sh", "-c", "python /mapper/run_isolated.py /src /data/tests.json /work/iso $(nproc) && python /mapper/build_map.py /src /data/tests.json /work/iso /out/map.pkl.gz"]
+CMD ["sh", "-c", "python /mapper/run_isolated.py /src /data/tests.json /work/iso $(nproc) && python /mapper/run_probes.py /src /data/tests.json /work/probes $(nproc) && python /mapper/build_map.py /src /data/tests.json /work/iso /out/map.pkl.gz /work/probes"]

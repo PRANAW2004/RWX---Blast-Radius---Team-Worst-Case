@@ -18,6 +18,7 @@ import sys
 import coverage
 
 root, tests_json, iso_dir, out_path = sys.argv[1:5]
+probe_dir = sys.argv[5] if len(sys.argv) > 5 else None
 root = os.path.realpath(root)
 tests = json.load(open(tests_json))["tests"]
 count = len(tests)
@@ -75,19 +76,47 @@ for test in tests:
     files[test["file"]] = files.get(test["file"], 0) | (1 << test["number"])
 test_files = {f: intern(b) for f, b in files.items()}
 
-sets = [0] * len(table)
-for bits, index in table.items():
-    sets[index] = bits
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from build_refs import build as build_refs  # noqa: E402
+
+# Comparison probes (run_probes.py): site -> tests where an operand pair was not
+# identity-safe, i.e. where swapping `is` and `==` could change the result.
+probe_bits, probe_unreliable, probed_files = {}, 0, []
+if probe_dir:
+    for test in tests:
+        number = test["number"]
+        path = os.path.join(probe_dir, f"probe.{number}.json")
+        if not os.path.exists(path):
+            probe_unreliable |= 1 << number
+            continue
+        record = json.load(open(path))
+        if record["outcome"] != 0:
+            probe_unreliable |= 1 << number
+        for site in record["unsafe"]:
+            probe_bits[site] = probe_bits.get(site, 0) | (1 << number)
+    cache = os.path.join(probe_dir, "code-cache")
+    probed_files = sorted(name[: -len(".marshal")].replace("__", "/") for name in os.listdir(cache) if name.endswith(".marshal"))
+    print(f"probes: {len(probe_bits)} unsafe sites, {bin(probe_unreliable).count('1')} unreliable tests, {len(probed_files)} files", file=sys.stderr)
 
 payload = {
+    "probes": {site: intern(b) for site, b in probe_bits.items()},
+    "probe_unreliable": probe_unreliable,
+    "probed_files": probed_files,
+    "refs": build_refs(root),
     "count": count,
     "ms": [int(t["seconds"] * 1000 + 0.5) for t in tests],
-    "sets": sets,
     "lines": lines,
     "reads": reads,
     "classes": classes,
     "test_files": test_files,
 }
+# The lookup table is filled last, after every set above has been interned.
+sets = [0] * len(table)
+for bits, index in table.items():
+    sets[index] = bits
+payload["sets"] = sets
+
 with gzip.open(out_path, "wb", compresslevel=9) as f:
     pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
 print(
