@@ -254,79 +254,6 @@ def header_shape_def(node):
             own_shape_any(node.returns) if node.returns else None, type(node).__name__)
 
 
-SETTING = __import__("re").compile(r"^[A-Z][A-Z0-9_]*$")
-
-
-def changed_settings(old, new):
-    """Names of ALL_CAPS class settings whose values changed, if that is the class's
-    only change (same header, same statements otherwise); else None."""
-    if not isinstance(new, ast.ClassDef):
-        return None
-    if own_shape_any(old.bases) != own_shape_any(new.bases) or own_shape_any(old.keywords) != own_shape_any(
-        new.keywords
-    ) or own_shape_any(old.decorator_list) != own_shape_any(new.decorator_list):
-        return None
-    old_body, new_body = strip_docstring(old, old.body), strip_docstring(new, new.body)
-    if len(old_body) != len(new_body):
-        return None
-    names = set()
-    for o, n in zip(old_body, new_body):
-        if stmt_shape(o) == stmt_shape(n):
-            continue
-        target_o, target_n = setting_target(o), setting_target(n)
-        if target_o is None or target_o != target_n:
-            return None
-        names.add(target_o)
-    return names or None
-
-
-def setting_target(node):
-    if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
-        name = node.targets[0].id
-    elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.value is not None:
-        name = node.target.id
-    else:
-        return None
-    return name if SETTING.match(name) else None
-
-
-COMPARE_OPS = {ast.Is: 0, ast.IsNot: 1, ast.Eq: 2, ast.NotEq: 3}
-
-
-def single_operator_swap(old, new):
-    """If old and new differ only in the operator of one single-operator is / is not /
-    == / != comparison, return ("line:col", old operator id, new operator id), else None."""
-    old_nodes, new_nodes = list(ast.walk(old)), list(ast.walk(new))
-    if len(old_nodes) != len(new_nodes):
-        return None
-    found = None
-    for o, n in zip(old_nodes, new_nodes):
-        if isinstance(o, ast.cmpop) and isinstance(n, ast.cmpop):
-            continue  # judged with their Compare
-        if type(o) is not type(n):
-            return None
-        for name, value in ast.iter_fields(o):
-            other = getattr(n, name, None)
-            if isinstance(value, ast.AST) or name == "ops":
-                continue
-            if isinstance(value, list):
-                if len(value) != len(other) or any(
-                    not isinstance(v, ast.AST) and (type(v) is not type(w) or v != w) for v, w in zip(value, other)
-                ):
-                    return None
-            elif type(value) is not type(other) or value != other:
-                return None
-        if isinstance(o, ast.Compare):
-            old_ops, new_ops = [type(x) for x in o.ops], [type(x) for x in n.ops]
-            if old_ops != new_ops:
-                if found is not None or len(old_ops) != 1 or len(new_ops) != 1:
-                    return None
-                if old_ops[0] not in COMPARE_OPS or new_ops[0] not in COMPARE_OPS:
-                    return None
-                found = (f"{o.lineno}:{o.col_offset}", COMPARE_OPS[old_ops[0]], COMPARE_OPS[new_ops[0]])
-    return found
-
-
 def changed_scopes(old_scopes, new_scopes, removed, added):
     candidates = set()
     for line in removed:
@@ -373,6 +300,58 @@ def statement_ranges(old_fn, new_fn):
     if not align_blocks(old_fn, strip_docstring(old_fn, old_fn.body), strip_docstring(new_fn, new_fn.body), ranges):
         return None
     return ranges
+
+
+def changed_scalar_attribute(old, new):
+    """Find a single class assignment whose scalar value alone was replaced."""
+    if len(old.body) != len(new.body):
+        return None
+    for a, b in zip(old.body, new.body):
+        if not (isinstance(a, ast.Assign) and isinstance(b, ast.Assign)
+                and len(a.targets) == 1 and isinstance(a.targets[0], ast.Name)):
+            continue
+        try:
+            x, y = ast.literal_eval(a.value), ast.literal_eval(b.value)
+        except (ValueError, TypeError):
+            continue
+        if type(x) not in (bool, int, float, str) or type(x) is not type(y) or x == y:
+            continue
+        saved = b.value
+        try:
+            b.value = a.value
+            if own_shape(old) == own_shape(new):
+                return a.targets[0].id
+        finally:
+            b.value = saved
+    return None
+
+
+def comparison_equivalent(old, new, sites, categories):
+    """Recognize a single identity/equality substitution with unchanged operands."""
+    old_tests = [n for n in ast.walk(old) if isinstance(n, ast.Compare)]
+    new_tests = [n for n in ast.walk(new) if isinstance(n, ast.Compare)]
+    if len(old_tests) != len(new_tests):
+        return False
+    pairs = {frozenset((ast.Is, ast.Eq)), frozenset((ast.IsNot, ast.NotEq))}
+    for before, after in zip(old_tests, new_tests):
+        if len(before.ops) != 1 or len(after.ops) != 1:
+            continue
+        if frozenset((type(before.ops[0]), type(after.ops[0]))) not in pairs:
+            continue
+        types = sites.get(f"{before.lineno},{before.col_offset}")
+        if types is None:
+            return False
+        left, right = types
+        tags = {categories[t] for t in left + right if t != "None"}
+        if len(tags) > 1:
+            return False
+        saved = after.ops
+        try:
+            after.ops = before.ops
+            return ast.dump(old) == ast.dump(new)
+        finally:
+            after.ops = saved
+    return False
 
 
 def function_traits(fn):
@@ -502,6 +481,20 @@ def stmt_shape_list(block):
 
 class Selector:
     def __init__(self, data):
+        from profile_select import Profiles
+        self.profiles = Profiles()
+        self.sites = {}
+        self.categories = {}
+        self.attribute_users = {}
+        try:
+            with open(os.path.join(HERE, "type-map.json"), encoding="utf8") as f:
+                type_map = json.load(f)
+            self.sites = type_map["sites"]
+            self.categories = type_map["types"]
+            with open(os.path.join(HERE, "attributes.json"), encoding="utf8") as f:
+                self.attribute_users = {k: int(v, 16) for k, v in json.load(f).items()}
+        except FileNotFoundError:
+            pass  # Older installations can still use the original coverage map.
         self.count = data["count"]
         self.ms = data["ms"]
         self.sets = data["sets"]
@@ -509,10 +502,6 @@ class Selector:
         self.reads = data["reads"]
         self.classes = data["classes"]
         self.test_files = data["test_files"]
-        self.refs = data.get("refs", {})
-        self.probes = data.get("probes", {})
-        self.probe_unreliable = data.get("probe_unreliable", 0)
-        self.probed_files = set(data.get("probed_files", ()))
         self.all = (1 << self.count) - 1
 
     def line_users(self, path, start, end):
@@ -547,18 +536,18 @@ class Selector:
 
     def select(self, patch_text):
         bits = 0
-        for change in parse_patch(patch_text):
+        changes = parse_patch(patch_text)
+        for change in changes:
             try:
-                bits |= self.select_change(change)
+                bits |= self.select_change(change, len(changes) == 1)
             except Exception as error:  # never crash: fall back to everything the file touches
                 log(f"fallback on {change.get('old') or change.get('new')}: {error!r}")
                 path = change.get("old") or change.get("new") or ""
-                bits |= self.importers(path) | self.readers(path) | self.tests_in(path)
-                if not bits:
-                    bits = self.all
+                affected = self.importers(path) | self.readers(path) | self.tests_in(path)
+                bits |= affected or self.all
         return bits
 
-    def select_change(self, change):
+    def select_change(self, change, single_file=True):
         old_path, new_path = change["old"], change["new"]
         bits = 0
         for path in {old_path, new_path} - {None}:
@@ -592,8 +581,25 @@ class Selector:
             return bits | self.importers(old_path) | self.tests_in(old_path)
 
         old_scopes, new_scopes = Scopes(old_tree), Scopes(new_tree)
-        for scope in changed_scopes(old_scopes, new_scopes, removed, added):
-            bits |= self.scope_users(old_path, old_scopes, scope, new_scopes)
+        changed = changed_scopes(old_scopes, new_scopes, removed, added)
+        impacted = 0
+        for scope in changed:
+            impacted |= self.scope_users(old_path, old_scopes, scope, new_scopes)
+        if single_file and old_path == new_path and len(changed) == 1 and impacted:
+            scope = next(iter(changed))
+            old = old_scopes.nodes[scope]
+            new = new_scopes.nodes.get(scope)
+            if (isinstance(old, (ast.FunctionDef, ast.AsyncFunctionDef)) and isinstance(new, type(old))
+                    and old_path in self.sites
+                    and comparison_equivalent(old, new, self.sites[old_path], self.categories)):
+                return bits
+            if isinstance(old, ast.ClassDef) and isinstance(new, ast.ClassDef):
+                attr = changed_scalar_attribute(old, new)
+                if attr in self.attribute_users:
+                    impacted &= self.attribute_users[attr]
+            if new is not None:
+                impacted &= self.profiles.mask(old_path, old, new)
+        bits |= impacted
         if new_path != old_path:  # renamed module: everything importing the old name
             bits |= self.importers(old_path)
         return bits
@@ -610,14 +616,6 @@ class Selector:
                     bits = 0
                     for start, end in ranges:
                         bits |= self.line_users(path, start, end)
-                    swap = single_operator_swap(node, new_node) if path in self.probed_files else None
-                    if swap is not None and {swap[1], swap[2]} in ({0, 2}, {1, 3}):
-                        # Only `is` <-> `==` (or `is not` <-> `!=`) changed at one site. For a test
-                        # whose operand types there were all identity-safe, `==` is `is`: its
-                        # execution is unchanged. Keep only the other tests.
-                        index = self.probes.get(f"{path}:{swap[0]}")
-                        unsafe = self.sets[index] if index is not None else 0
-                        bits &= unsafe | self.probe_unreliable
                     return bits
             start = node.body[0].lineno if node.body else node.lineno
             return self.line_users(path, start, node.end_lineno)
@@ -631,17 +629,7 @@ class Selector:
         index = self.classes.get(key) if key else None
         if index is None or "#" in name:
             return bits | self.importers(path)
-        users = self.sets[index]
-        new_node = new_scopes.nodes.get(name) if new_scopes is not None else None
-        settings = changed_settings(node, new_node) if REFINE and new_node is not None else None
-        if settings:
-            # Only setting values changed: tests that use the class AND run code reading them.
-            readers = 0
-            for setting in settings:
-                for ref_path, start, end in self.refs.get(setting, ()):
-                    readers |= self.line_users(ref_path, start, end)
-            return users & readers
-        return bits | users
+        return bits | self.sets[index]
 
     def directory_readers(self, path):
         directory = os.path.dirname(path) + "/"
@@ -708,10 +696,14 @@ def schedule(numbers, ms):
     if not numbers:
         return []
     ordered = sorted(numbers, key=lambda n: (-ms[n], n))
+    total_ms = sum(ms[n] for n in ordered)
     best, best_cost = None, None
     for count in range(1, MAX_WORKERS + 1):
         if count > len(ordered):
             break
+        lower_bound = max(ms[ordered[0]], (total_ms + count - 1) // count)
+        if best_cost is not None and lower_bound + WORKER_MS * count >= best_cost:
+            continue
         loads = [0] * count
         workers = [[] for _ in range(count)]
         for n in ordered:
@@ -753,6 +745,8 @@ def main():
                              "sets": [], "lines": {}, "reads": {}, "classes": {}, "test_files": {}})
         selector.select = lambda text: selector.all
     commits = os.path.join(DATA, "commits")
+    from verify_selection import Probe
+    probe = Probe(SOURCE, DATA)
     out = []
     total = 0
     for entry in sorted(os.listdir(commits)):
@@ -767,6 +761,11 @@ def main():
             log(f"{commit}: error {error!r}, running everything")
             bits = selector.all
         numbers = bits_to_numbers(bits & selector.all)
+        if bits != selector.all and numbers:
+            try:
+                numbers = probe.filter(parse_patch(text), numbers, selector.ms, apply_hunks)
+            except Exception as error:
+                log(f"{commit}: probe unavailable: {error!r}")
         workers = schedule(numbers, selector.ms)
         cost = (max(sum(selector.ms[n] for n in w) for w in workers) + WORKER_MS * len(workers)) if workers else 0
         total += cost

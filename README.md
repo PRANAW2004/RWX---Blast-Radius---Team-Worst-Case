@@ -5,7 +5,15 @@ The selector uses the pinned SQLGlot checkout and per-test coverage to estimate 
 * For an identity/equality substitution, the selector checks inferred operand types and verifies that restoring the original operator reproduces the original function syntax tree. Supported types include booleans, conventional enum members, and project classes that inherit identity equality. Python permits values outside their annotations, so this is a static prediction.
 * For a changed scalar class setting, the selector intersects the original class candidates with coverage of statements that read the attribute name. String references disable this refinement for that name. Computed attribute names can still escape static analysis.
 
-The image ships both indexes. To regenerate them, use Python 3.13 with the locked dependencies, set `ENTRY` to the absolute path of this repository and `SQLGLOT` to the absolute path of the pinned checkout, then run
+The selector also uses a dynamic profile from the unpatched checkout. It tracks comparison outcomes, dictionary reads, and calls through dispatch tables for individual tests. Spawned workers contribute their observations to their parent test. Small candidate groups can be run against the patched copy within a CPU budget. A failing test, incomplete probe, or unsupported outcome stays in the schedule. The probe uses unittest with one forked pool worker. Collection and process behavior can differ from the official pytest run.
+
+Regenerate the profile with the same Python 3.13 environment and locked dependencies used for the maps below:
+
+```sh
+OPENBLAS_NUM_THREADS=1 PYTHON_CPU_COUNT=2 python "$ENTRY/mapper/build_profile.py" "$SQLGLOT" "$ENTRY/sample/tests.json" "$ENTRY/profile.json.gz"
+```
+
+The image ships the generated indexes. To regenerate them, use Python 3.13 with the locked dependencies, set `ENTRY` to the absolute path of this repository and `SQLGLOT` to the absolute path of the pinned checkout, then run
 
 ```sh
 (cd "$SQLGLOT" && python "$ENTRY/mapper/build_type_map.py" "$ENTRY/type-map.json")
