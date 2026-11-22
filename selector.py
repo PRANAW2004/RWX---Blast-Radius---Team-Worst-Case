@@ -254,6 +254,110 @@ def header_shape_def(node):
             own_shape_any(node.returns) if node.returns else None, type(node).__name__)
 
 
+SETTING = __import__("re").compile(r"^[A-Z][A-Z0-9_]*$")
+
+
+def changed_settings(old, new):
+    """Names of ALL_CAPS class settings whose values changed, if that is the class's
+    only change (same header, same statements otherwise); else None."""
+    if isinstance(old, ast.Module) and isinstance(new, ast.Module):
+        pass
+    elif not isinstance(new, ast.ClassDef) or not isinstance(old, ast.ClassDef):
+        return None
+    elif own_shape_any(old.bases) != own_shape_any(new.bases) or own_shape_any(old.keywords) != own_shape_any(
+        new.keywords
+    ) or own_shape_any(old.decorator_list) != own_shape_any(new.decorator_list):
+        return None
+    old_body, new_body = strip_docstring(old, old.body), strip_docstring(new, new.body)
+    if len(old_body) != len(new_body):
+        return None
+    names = set()
+    for o, n in zip(old_body, new_body):
+        if stmt_shape(o) == stmt_shape(n):
+            continue
+        target_o, target_n = setting_target(o), setting_target(n)
+        if target_o is None or target_o != target_n:
+            return None
+        names.add(target_o)
+    return names or None
+
+
+def setting_target(node):
+    if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+        name = node.targets[0].id
+    elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.value is not None:
+        name = node.target.id
+    else:
+        return None
+    return name if SETTING.match(name) else None
+
+
+COMPARE_OPS = {ast.Is: 0, ast.IsNot: 1, ast.Eq: 2, ast.NotEq: 3, ast.Lt: 4, ast.LtE: 5, ast.Gt: 6, ast.GtE: 7}
+
+
+def single_operator_swap(old, new):
+    """If old and new differ only in the operator of one single-operator is / is not /
+    == / != comparison, return ("line:col", old operator id, new operator id), else None."""
+    old_nodes, new_nodes = list(ast.walk(old)), list(ast.walk(new))
+    if len(old_nodes) != len(new_nodes):
+        return None
+    found = None
+    for o, n in zip(old_nodes, new_nodes):
+        if isinstance(o, ast.cmpop) and isinstance(n, ast.cmpop):
+            continue  # judged with their Compare
+        if type(o) is not type(n):
+            return None
+        for name, value in ast.iter_fields(o):
+            other = getattr(n, name, None)
+            if isinstance(value, ast.AST) or name == "ops":
+                continue
+            if isinstance(value, list):
+                if len(value) != len(other) or any(
+                    not isinstance(v, ast.AST) and (type(v) is not type(w) or v != w) for v, w in zip(value, other)
+                ):
+                    return None
+            elif type(value) is not type(other) or value != other:
+                return None
+        if isinstance(o, ast.Compare):
+            old_ops, new_ops = [type(x) for x in o.ops], [type(x) for x in n.ops]
+            if old_ops != new_ops:
+                if found is not None or len(old_ops) != 1 or len(new_ops) != 1:
+                    return None
+                if old_ops[0] not in COMPARE_OPS or new_ops[0] not in COMPARE_OPS:
+                    return None
+                found = (f"{o.lineno}:{o.col_offset}", COMPARE_OPS[old_ops[0]], COMPARE_OPS[new_ops[0]])
+    return found
+
+
+def changed_defaults(old, new):
+    """Positions (positional defaults first, then keyword-only ones, as run_probes.py
+    numbers them) of parameters whose default value is the only change; else None."""
+    if not isinstance(new, type(old)) or own_shape(old) == own_shape(new):
+        return None
+    if [own_shape_any(d) for d in old.decorator_list] != [own_shape_any(d) for d in new.decorator_list]:
+        return None
+    if (own_shape_any(old.returns) if old.returns else None) != (own_shape_any(new.returns) if new.returns else None):
+        return None
+    a, b = old.args, new.args
+    for field in ("posonlyargs", "args", "kwonlyargs", "vararg", "kwarg"):
+        if own_shape_any(getattr(a, field)) != own_shape_any(getattr(b, field)):
+            return None
+    if len(a.defaults) != len(b.defaults) or [d is None for d in a.kw_defaults] != [d is None for d in b.kw_defaults]:
+        return None
+    if [stmt_shape(x) for x in strip_docstring(old, old.body)] != [stmt_shape(x) for x in strip_docstring(new, new.body)]:
+        return None
+    changed = []
+    for i, (x, y) in enumerate(zip(a.defaults, b.defaults)):
+        if own_shape_any(x) != own_shape_any(y):
+            changed.append(i)
+    base = len(a.defaults)
+    keyword = [(x, y) for x, y in zip(a.kw_defaults, b.kw_defaults) if x is not None]
+    for j, (x, y) in enumerate(keyword):
+        if own_shape_any(x) != own_shape_any(y):
+            changed.append(base + j)
+    return changed or None
+
+
 def changed_scopes(old_scopes, new_scopes, removed, added):
     candidates = set()
     for line in removed:
@@ -297,61 +401,13 @@ def statement_ranges(old_fn, new_fn):
     if function_traits(old_fn) != function_traits(new_fn):
         return None
     ranges = []
-    if not align_blocks(old_fn, strip_docstring(old_fn, old_fn.body), strip_docstring(new_fn, new_fn.body), ranges):
-        return None
+    _FUNCTION.append(old_fn)
+    try:
+        if not align_blocks(old_fn, strip_docstring(old_fn, old_fn.body), strip_docstring(new_fn, new_fn.body), ranges):
+            return None
+    finally:
+        _FUNCTION.pop()
     return ranges
-
-
-def changed_scalar_attribute(old, new):
-    """Find a single class assignment whose scalar value alone was replaced."""
-    if len(old.body) != len(new.body):
-        return None
-    for a, b in zip(old.body, new.body):
-        if not (isinstance(a, ast.Assign) and isinstance(b, ast.Assign)
-                and len(a.targets) == 1 and isinstance(a.targets[0], ast.Name)):
-            continue
-        try:
-            x, y = ast.literal_eval(a.value), ast.literal_eval(b.value)
-        except (ValueError, TypeError):
-            continue
-        if type(x) not in (bool, int, float, str) or type(x) is not type(y) or x == y:
-            continue
-        saved = b.value
-        try:
-            b.value = a.value
-            if own_shape(old) == own_shape(new):
-                return a.targets[0].id
-        finally:
-            b.value = saved
-    return None
-
-
-def comparison_equivalent(old, new, sites, categories):
-    """Recognize a single identity/equality substitution with unchanged operands."""
-    old_tests = [n for n in ast.walk(old) if isinstance(n, ast.Compare)]
-    new_tests = [n for n in ast.walk(new) if isinstance(n, ast.Compare)]
-    if len(old_tests) != len(new_tests):
-        return False
-    pairs = {frozenset((ast.Is, ast.Eq)), frozenset((ast.IsNot, ast.NotEq))}
-    for before, after in zip(old_tests, new_tests):
-        if len(before.ops) != 1 or len(after.ops) != 1:
-            continue
-        if frozenset((type(before.ops[0]), type(after.ops[0]))) not in pairs:
-            continue
-        types = sites.get(f"{before.lineno},{before.col_offset}")
-        if types is None:
-            return False
-        left, right = types
-        tags = {categories[t] for t in left + right if t != "None"}
-        if len(tags) > 1:
-            return False
-        saved = after.ops
-        try:
-            after.ops = before.ops
-            return ast.dump(old) == ast.dump(new)
-        finally:
-            after.ops = saved
-    return False
 
 
 def function_traits(fn):
@@ -437,20 +493,25 @@ def align_blocks(parent, old_body, new_body, ranges):
         # Statements removed or inserted: tests that reach this point of the block.
         for o in old_body[i1:i2]:
             ranges.append(statement_range(o))
+        # Reaching the edit point means running the statement before it, or (at the start of
+        # a block) the first statement after it.
         if i1 > 0:
             ranges.append(statement_range(old_body[i1 - 1]))
         if i2 < len(old_body):
             ranges.append(statement_range(old_body[i2]))
-        if (i1 == 0 or i2 == len(old_body)) and parent is not None:
-            if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                return False  # entry/exit of the function: use the whole function
-            ranges.append((parent.lineno, parent.end_lineno) if isinstance(parent, ast.ExceptHandler) else header_range(parent))
+        if (i1 == 0 or i2 == len(old_body)) and isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return False  # entry/exit of the function: use the whole function
     return True
 
 
 def align_statement(old, new, ranges):
     if isinstance(old, DEF_TYPES) or isinstance(new, DEF_TYPES):
         return False
+    uses = constant_assignment_uses(old, new)
+    if uses is not None:
+        # The new value matters only to tests that run the assignment AND read the name.
+        ranges.append(("&", statement_range(old), uses))
+        return True
     if type(old) is not type(new) or not isinstance(old, COMPOUND):
         ranges.append(statement_range(old))
         return True
@@ -464,12 +525,94 @@ def align_statement(old, new, ranges):
                 continue
             if not align_blocks(old if field == "body" else None, old_block, new_block, ranges):
                 return False
-            if field != "body":
-                ranges.append(header_range(old))
     old_handlers, new_handlers = getattr(old, "handlers", []), getattr(new, "handlers", [])
     if [own_shape_any(h) for h in old_handlers] != [own_shape_any(h) for h in new_handlers]:
         ranges.append(statement_range(old))  # exception matching: the whole try
     return True
+
+
+_FUNCTION = []  # the old function being aligned, for def-use lookups
+DYNAMIC_SCOPE = {"locals", "vars", "eval", "exec", "globals"}
+
+
+def is_constant(node):
+    """A literal whose evaluation cannot raise or have side effects."""
+    if isinstance(node, ast.Constant):
+        return True
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd, ast.Not)):
+        return isinstance(node.operand, ast.Constant) and isinstance(node.operand.value, (int, float, bool))
+    if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+        return all(is_constant(e) for e in node.elts)
+    return False
+
+
+def assigned_names(target):
+    if isinstance(target, ast.Name):
+        return [target.id]
+    if isinstance(target, (ast.Tuple, ast.List)) and all(isinstance(e, ast.Name) for e in target.elts):
+        return [e.id for e in target.elts] if not isinstance(target, ast.List) or True else None
+    return None
+
+
+def constant_assignment_uses(old, new):
+    """If old and new assign different constants to the same local names, return the
+    ranges of the statements that read those names (the only places the value can
+    matter); else None."""
+    if not _FUNCTION or type(old) is not type(new):
+        return None
+    if isinstance(old, ast.Assign):
+        if len(old.targets) != 1 or len(new.targets) != 1:
+            return None
+        old_target, new_target = old.targets[0], new.targets[0]
+    elif isinstance(old, ast.AnnAssign) and old.value is not None and new.value is not None and old.simple:
+        old_target, new_target = old.target, new.target
+        if own_shape_any(old.annotation) != own_shape_any(new.annotation):
+            return None
+    else:
+        return None
+    names = assigned_names(old_target)
+    if not names or own_shape_any(old_target) != own_shape_any(new_target):
+        return None
+    if not (is_constant(old.value) and is_constant(new.value)):
+        return None
+    if isinstance(old_target, ast.Tuple) and not (
+        isinstance(old.value, ast.Tuple) and isinstance(new.value, ast.Tuple)
+        and len(old.value.elts) == len(new.value.elts) == len(names)
+    ):
+        return None  # unpacking a constant could raise differently
+    function = _FUNCTION[-1]
+    wanted = set(names)
+    for node in ast.walk(function):
+        if isinstance(node, (ast.Global, ast.Nonlocal)) and wanted & set(node.names):
+            return None
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in DYNAMIC_SCOPE:
+            return None
+    spans = own_statement_spans(function)
+    uses = []
+    for node in ast.walk(function):
+        if isinstance(node, ast.Name) and node.id in wanted and isinstance(node.ctx, (ast.Load, ast.Del)):
+            uses.append(innermost_span(spans, node.lineno))
+    return uses
+
+
+def own_statement_spans(function):
+    spans = []
+    for node in ast.walk(function):
+        if isinstance(node, ast.stmt) and node is not function:
+            body = getattr(node, "body", None)
+            if isinstance(body, list) and body and isinstance(body[0], ast.AST):
+                spans.append((node.lineno, max(node.lineno, body[0].lineno - 1)))
+            else:
+                spans.append((node.lineno, node.end_lineno))
+    return spans
+
+
+def innermost_span(spans, line):
+    best = None
+    for start, end in spans:
+        if start <= line <= end and (best is None or end - start < best[1] - best[0]):
+            best = (start, end)
+    return best or (line, line)
 
 
 def stmt_shape_list(block):
@@ -481,20 +624,6 @@ def stmt_shape_list(block):
 
 class Selector:
     def __init__(self, data):
-        from profile_select import Profiles
-        self.profiles = Profiles()
-        self.sites = {}
-        self.categories = {}
-        self.attribute_users = {}
-        try:
-            with open(os.path.join(HERE, "type-map.json"), encoding="utf8") as f:
-                type_map = json.load(f)
-            self.sites = type_map["sites"]
-            self.categories = type_map["types"]
-            with open(os.path.join(HERE, "attributes.json"), encoding="utf8") as f:
-                self.attribute_users = {k: int(v, 16) for k, v in json.load(f).items()}
-        except FileNotFoundError:
-            pass  # Older installations can still use the original coverage map.
         self.count = data["count"]
         self.ms = data["ms"]
         self.sets = data["sets"]
@@ -502,6 +631,12 @@ class Selector:
         self.reads = data["reads"]
         self.classes = data["classes"]
         self.test_files = data["test_files"]
+        self.refs = data.get("refs", {})
+        self.probes = data.get("probes", {})
+        self.probe_unreliable = data.get("probe_unreliable", 0)
+        self.probed_files = set(data.get("probed_files", ()))
+        self.probe_masks = data.get("probe_masks", {})
+        self.probe_used = data.get("probe_used", {})
         self.all = (1 << self.count) - 1
 
     def line_users(self, path, start, end):
@@ -536,18 +671,18 @@ class Selector:
 
     def select(self, patch_text):
         bits = 0
-        changes = parse_patch(patch_text)
-        for change in changes:
+        for change in parse_patch(patch_text):
             try:
-                bits |= self.select_change(change, len(changes) == 1)
+                bits |= self.select_change(change)
             except Exception as error:  # never crash: fall back to everything the file touches
                 log(f"fallback on {change.get('old') or change.get('new')}: {error!r}")
                 path = change.get("old") or change.get("new") or ""
-                affected = self.importers(path) | self.readers(path) | self.tests_in(path)
-                bits |= affected or self.all
+                bits |= self.importers(path) | self.readers(path) | self.tests_in(path)
+                if not bits:
+                    bits = self.all
         return bits
 
-    def select_change(self, change, single_file=True):
+    def select_change(self, change):
         old_path, new_path = change["old"], change["new"]
         bits = 0
         for path in {old_path, new_path} - {None}:
@@ -581,25 +716,8 @@ class Selector:
             return bits | self.importers(old_path) | self.tests_in(old_path)
 
         old_scopes, new_scopes = Scopes(old_tree), Scopes(new_tree)
-        changed = changed_scopes(old_scopes, new_scopes, removed, added)
-        impacted = 0
-        for scope in changed:
-            impacted |= self.scope_users(old_path, old_scopes, scope, new_scopes)
-        if single_file and old_path == new_path and len(changed) == 1 and impacted:
-            scope = next(iter(changed))
-            old = old_scopes.nodes[scope]
-            new = new_scopes.nodes.get(scope)
-            if (isinstance(old, (ast.FunctionDef, ast.AsyncFunctionDef)) and isinstance(new, type(old))
-                    and old_path in self.sites
-                    and comparison_equivalent(old, new, self.sites[old_path], self.categories)):
-                return bits
-            if isinstance(old, ast.ClassDef) and isinstance(new, ast.ClassDef):
-                attr = changed_scalar_attribute(old, new)
-                if attr in self.attribute_users:
-                    impacted &= self.attribute_users[attr]
-            if new is not None:
-                impacted &= self.profiles.mask(old_path, old, new)
-        bits |= impacted
+        for scope in changed_scopes(old_scopes, new_scopes, removed, added):
+            bits |= self.scope_users(old_path, old_scopes, scope, new_scopes)
         if new_path != old_path:  # renamed module: everything importing the old name
             bits |= self.importers(old_path)
         return bits
@@ -607,6 +725,11 @@ class Selector:
     def scope_users(self, path, scopes, name, new_scopes=None):
         node = scopes.nodes[name]
         if name == "" or isinstance(node, ast.Module):
+            new_node = new_scopes.nodes.get("") if new_scopes is not None else None
+            settings = changed_settings(node, new_node) if REFINE and new_node is not None else None
+            if settings:
+                # Only ALL_CAPS constants changed value: importers that run code reading them.
+                return self.importers(path) & self.readers_of(settings)
             return self.importers(path)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             new_node = new_scopes.nodes.get(name) if new_scopes is not None else None
@@ -614,11 +737,42 @@ class Selector:
                 ranges = statement_ranges(node, new_node)
                 if ranges is not None:
                     bits = 0
-                    for start, end in ranges:
-                        bits |= self.line_users(path, start, end)
+                    for item in ranges:
+                        if item[0] == "&":
+                            uses = 0
+                            for start, end in item[2]:
+                                uses |= self.line_users(path, start, end)
+                            bits |= self.line_users(path, *item[1]) & uses
+                        else:
+                            bits |= self.line_users(path, *item)
+                    swap = single_operator_swap(node, new_node) if path in self.probed_files else None
+                    if swap is not None and {swap[1], swap[2]} in ({0, 2}, {1, 3}):
+                        # Only `is` <-> `==` (or `is not` <-> `!=`) changed at one site. For a test
+                        # whose operand types there were all identity-safe, `==` is `is`: its
+                        # execution is unchanged. Keep only the other tests.
+                        index = self.probes.get(f"{path}:{swap[0]}")
+                        unsafe = self.sets[index] if index is not None else 0
+                        bits &= unsafe | self.probe_unreliable
+                    elif swap is not None and swap[1] >= 4 and swap[2] >= 2:
+                        # An ordering comparison's operator changed: keep the tests in which the new
+                        # operator would ever have given a different result there.
+                        index = self.probe_masks.get(f"{path}:{swap[0]}", {}).get(swap[2])
+                        differs = self.sets[index] if index is not None else 0
+                        bits &= differs | self.probe_unreliable
                     return bits
             start = node.body[0].lineno if node.body else node.lineno
-            return self.line_users(path, start, node.end_lineno)
+            bits = self.line_users(path, start, node.end_lineno)
+            changed = changed_defaults(node, new_node) if REFINE and path in self.probed_files else None
+            if changed:
+                # Only default values changed: a call that passed those arguments behaves the same.
+                used = self.probe_used.get(f"{path}:{node.lineno}:{node.col_offset}", {})
+                users = self.probe_unreliable
+                for position in list(changed) + [-1]:
+                    index = used.get(position)
+                    if index is not None:
+                        users |= self.sets[index]
+                return bits & users
+            return bits
         # A class: its instances' tests, and the users of its methods.
         module = module_name(path)
         key = f"{module}:{name}" if module else None
@@ -629,7 +783,34 @@ class Selector:
         index = self.classes.get(key) if key else None
         if index is None or "#" in name:
             return bits | self.importers(path)
-        return bits | self.sets[index]
+        users = self.sets[index]
+        new_node = new_scopes.nodes.get(name) if new_scopes is not None else None
+        settings = changed_settings(node, new_node) if REFINE and new_node is not None else None
+        if settings:
+            # Only setting values changed: tests that use the class AND run code reading them.
+            return users & self.readers_of(settings)
+        return bits | users
+
+    def readers_of(self, names):
+        """Tests that execute a statement reading any of these names."""
+        readers = 0
+        for name in names:
+            for ref in self.refs.get(name, ()):
+                if len(ref) == 4 and ref[1] == "default":
+                    # Read inside a default value: only calls that used that default.
+                    used = self.probe_used.get(ref[2])
+                    if used is None or ref[0] not in self.probed_files:
+                        readers |= self.importers(ref[0])
+                        continue
+                    readers |= self.probe_unreliable
+                    for position in (ref[3], -1):
+                        index = used.get(position)
+                        if index is not None:
+                            readers |= self.sets[index]
+                else:
+                    ref_path, start, end = ref
+                    readers |= self.line_users(ref_path, start, end)
+        return readers
 
     def directory_readers(self, path):
         directory = os.path.dirname(path) + "/"
@@ -696,14 +877,10 @@ def schedule(numbers, ms):
     if not numbers:
         return []
     ordered = sorted(numbers, key=lambda n: (-ms[n], n))
-    total_ms = sum(ms[n] for n in ordered)
     best, best_cost = None, None
     for count in range(1, MAX_WORKERS + 1):
         if count > len(ordered):
             break
-        lower_bound = max(ms[ordered[0]], (total_ms + count - 1) // count)
-        if best_cost is not None and lower_bound + WORKER_MS * count >= best_cost:
-            continue
         loads = [0] * count
         workers = [[] for _ in range(count)]
         for n in ordered:
@@ -745,8 +922,6 @@ def main():
                              "sets": [], "lines": {}, "reads": {}, "classes": {}, "test_files": {}})
         selector.select = lambda text: selector.all
     commits = os.path.join(DATA, "commits")
-    from verify_selection import Probe
-    probe = Probe(SOURCE, DATA)
     out = []
     total = 0
     for entry in sorted(os.listdir(commits)):
@@ -761,11 +936,6 @@ def main():
             log(f"{commit}: error {error!r}, running everything")
             bits = selector.all
         numbers = bits_to_numbers(bits & selector.all)
-        if bits != selector.all and numbers:
-            try:
-                numbers = probe.filter(parse_patch(text), numbers, selector.ms, apply_hunks)
-            except Exception as error:
-                log(f"{commit}: probe unavailable: {error!r}")
         workers = schedule(numbers, selector.ms)
         cost = (max(sum(selector.ms[n] for n in w) for w in workers) + WORKER_MS * len(workers)) if workers else 0
         total += cost

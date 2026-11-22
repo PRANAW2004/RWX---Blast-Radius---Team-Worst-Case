@@ -50,6 +50,15 @@ def build(root):
                 except SyntaxError:
                     continue
                 spans = statement_spans(tree)
+                # Names read inside a default value only matter to calls using that default.
+                in_default = {}
+                for fn in ast.walk(tree):
+                    if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        site = f"{rel}:{fn.lineno}:{fn.col_offset}"
+                        keyword = [d for d in fn.args.kw_defaults if d is not None]
+                        for position, default in enumerate(list(fn.args.defaults) + keyword):
+                            for inner in ast.walk(default):
+                                in_default[id(inner)] = (site, position)
                 for node in ast.walk(tree):
                     ident = None
                     if isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load):
@@ -59,5 +68,8 @@ def build(root):
                     elif isinstance(node, ast.Constant) and isinstance(node.value, str):
                         ident = node.value
                     if ident and CAPS.match(ident):
-                        refs.setdefault(ident, set()).add((rel,) + innermost(spans, node.lineno))
-    return {k: sorted(v) for k, v in refs.items()}
+                        if id(node) in in_default:
+                            refs.setdefault(ident, set()).add((rel, "default") + in_default[id(node)])
+                        else:
+                            refs.setdefault(ident, set()).add((rel,) + innermost(spans, node.lineno))
+    return {k: sorted(v, key=str) for k, v in refs.items()}

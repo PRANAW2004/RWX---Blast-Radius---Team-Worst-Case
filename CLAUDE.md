@@ -40,7 +40,7 @@ Then LPT packing for k = 1..8 workers, pick min(max load + 2 s * k).
 
 ## Results on the 30 sample commits
 
-0 misses. Simulated 117.2 s (v1 was 175.8 s, practice board 213.0 s with 0 misses).
+0 misses. Simulated 113.3 s (v1 175.8 -> board 213.0; v2 117.2 -> board 200.5; v3 114.7; this is v4).
 Perfect-knowledge floor on the samples (only the failing tests, best split) is 94.4 s.
 Selector CPU 0.3 s for 30 commits.
 
@@ -66,6 +66,27 @@ or the signature/decorators change.
 
 Instance tracking also covers spawn process-pool workers (optimizer/executor tests): 535z
 (TSQL.WEEK_OFFSET) breaks test_simplify only through a worker.
+
+v3 added (probes in mapper/run_probes.py, all sound by measurement):
+- Ordering swaps (< <= > >= == !=): per test, whether the new operator would ever have given
+  another result at that site (alternatives evaluated on the real operands every time).
+- Default values: per test, which default-valued parameters were called with their default
+  object. A change of only default values keeps tests that used that default.
+- Module-level ALL_CAPS constants: like class settings; a constant read inside a default value
+  counts only for calls that used that default.
+On 80 synthetic mutants: 526 -> 496.5 s. Remaining big costs are slow tests (test_execute_tpcds
+21.5 s, test_max_nodes 28.8 s) that really execute the changed code with the changed value;
+tpcds passed on 8 of 10 synthetic selections, but proving that needs running it.
+
+v4 (found with ground truth: realistic mutants labeled by the full suite):
+- Edits inside else/elif branches no longer add the first `if` header's users (redundant: the
+  edited statement or its neighbours already cover every test that reaches it). Sound.
+- A statement that only assigns a different constant to local names selects tests that run the
+  assignment AND a statement reading those names (falls back on global/nonlocal, locals(),
+  vars(), eval, exec). `is_underscore_separated = True -> False`: 36.8 s -> 2.5 s (perfect).
+- Ground truth: 11 realistic mutants, 0 misses, 48.7 s vs perfect 12.2 s. NOTE pytest 9 reports
+  subtest failures as `SUBFAILED[...] id` or `SUBFAILED(...) id` beside a PASSED test; parse
+  every line starting FAILED/ERROR/SUBFAILED for the tests/... id (see truth labeling).
 
 ## Verified earlier
 

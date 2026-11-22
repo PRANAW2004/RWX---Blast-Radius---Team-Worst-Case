@@ -5,10 +5,6 @@ FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf107
 ENV PYTHONDONTWRITEBYTECODE=1
 
 WORKDIR /app
-ENV OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1
-COPY requirements.lock /app/
-RUN grep -E '^(duckdb|numpy|pandas|pytz|python-dateutil|typing_extensions|tzdata)==' requirements.lock > /tmp/probe-requirements \
- && pip install --no-cache-dir -r /tmp/probe-requirements
 
 # sqlglot's source at the pinned commit: the selector diffs each patched file
 # against it to find which functions, classes or modules changed.
@@ -23,10 +19,10 @@ tar.extractall('/app/src', members=members, filter='data')" \
 
 # The coverage map built from the pinned commit (mapper/ shows how), unpacked
 # here so the run does not pay to decompress it.
-COPY map.pkl.gz type-map.json attributes.json profile.json.gz profile_select.py verify_selection.py selector.py run.py /app/
+COPY map.pkl.gz selector.py run.py /app/
 RUN python -c "import gzip, shutil; shutil.copyfileobj(gzip.open('/app/map.pkl.gz'), open('/app/map.pkl', 'wb'))" \
  && rm /app/map.pkl.gz \
- && python -m compileall -q /app/src/sqlglot /app/src/tests /app/*.py \
+ && python -m compileall -q /app/selector.py \
  && chmod -R a+rX /app
 
 ENV BLAST_MAP=/app/map.pkl

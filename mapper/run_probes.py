@@ -20,17 +20,71 @@ import os
 import sys
 import time
 
-OP_IDS = {ast.Is: 0, ast.IsNot: 1, ast.Eq: 2, ast.NotEq: 3}
-OPS = [operator.is_, operator.is_not, operator.eq, operator.ne]
-_seen = {}  # site -> set of (type(a), type(b))
+OP_IDS = {ast.Is: 0, ast.IsNot: 1, ast.Eq: 2, ast.NotEq: 3, ast.Lt: 4, ast.LtE: 5, ast.Gt: 6, ast.GtE: 7}
+OPS = [operator.is_, operator.is_not, operator.eq, operator.ne, operator.lt, operator.le, operator.gt, operator.ge]
+ORDER_ALTS = (2, 3, 4, 5, 6, 7)  # == != < <= > >=
+FULL = sum(1 << i for i in ORDER_ALTS)
+_seen = {}  # is/==/!= sites: site -> set of (type(a), type(b))
+_masks = {}  # ordering sites: site -> operators (of == != < <= > >=) that ever gave another result
+_defaults = {}  # function site -> (positional defaults, kw-only defaults)
+_used = {}  # function site -> bitmask of default-valued parameters whose default was used
 
 
 def _probe(site, op, a, b):
-    pairs = _seen.get(site)
-    if pairs is None:
-        pairs = _seen[site] = set()
-    pairs.add((type(a), type(b)))
-    return OPS[op](a, b)
+    if op < 4:
+        pairs = _seen.get(site)
+        if pairs is None:
+            pairs = _seen[site] = set()
+        pairs.add((type(a), type(b)))
+        return OPS[op](a, b)
+    mask = _masks.get(site, 0)
+    try:
+        result = OPS[op](a, b)
+    except BaseException:
+        _masks[site] = FULL
+        raise
+    if mask | (1 << op) != FULL:
+        for alt in ORDER_ALTS:
+            if alt == op or mask >> alt & 1:
+                continue
+            try:
+                other = OPS[alt](a, b)
+                same = type(other) is type(result) and other == result
+            except BaseException:
+                same = False
+            if not same:
+                mask |= 1 << alt
+        _masks[site] = mask
+    return result
+
+
+def _register(site):
+    def decorate(fn):
+        target = fn
+        while hasattr(target, "__wrapped__"):
+            target = target.__wrapped__
+        _defaults[site] = (getattr(target, "__defaults__", None) or (), getattr(target, "__kwdefaults__", None) or {})
+        return fn
+
+    return decorate
+
+
+def _defuse(site, positional, keyword):
+    """Mark each default-valued parameter whose value is its default object."""
+    registered = _defaults.get(site)
+    if registered is None:
+        _used[site] = -1  # unknown: treat every default as used
+        return
+    defaults, kwdefaults = registered
+    mask = _used.get(site, 0)
+    for i, value in enumerate(positional):
+        if i < len(defaults) and value is defaults[i]:
+            mask |= 1 << i
+    base = len(positional)
+    for j, (name, value) in enumerate(keyword):
+        if name in kwdefaults and value is kwdefaults[name]:
+            mask |= 1 << (base + j)
+    _used[site] = mask
 
 
 def identity_safe(ta, tb):
@@ -52,9 +106,47 @@ def identity_safe(ta, tb):
     return False
 
 
+def default_params(args):
+    """Parameter names with defaults: positional ones (in order), then keyword-only ones."""
+    positional = args.posonlyargs + args.args
+    with_defaults = [a.arg for a in positional[len(positional) - len(args.defaults):]]
+    keyword = [a.arg for a, d in zip(args.kwonlyargs, args.kw_defaults) if d is not None]
+    return with_defaults, keyword
+
+
 class _Rewriter(ast.NodeTransformer):
     def __init__(self, rel):
         self.rel = rel
+
+    def visit_FunctionDef(self, node):
+        self.generic_visit(node)
+        positional, keyword = default_params(node.args)
+        if not positional and not keyword:
+            return node
+        site = f"{self.rel}:{node.lineno}:{node.col_offset}"
+        node.decorator_list.append(
+            ast.Call(func=ast.Name(id="__blast_register__", ctx=ast.Load()), args=[ast.Constant(site)], keywords=[])
+        )
+        call = ast.Expr(
+            ast.Call(
+                func=ast.Name(id="__blast_defuse__", ctx=ast.Load()),
+                args=[
+                    ast.Constant(site),
+                    ast.Tuple([ast.Name(id=n, ctx=ast.Load()) for n in positional], ast.Load()),
+                    ast.Tuple(
+                        [ast.Tuple([ast.Constant(n), ast.Name(id=n, ctx=ast.Load())], ast.Load()) for n in keyword],
+                        ast.Load(),
+                    ),
+                ],
+                keywords=[],
+            )
+        )
+        body = node.body
+        at = 1 if body and isinstance(body[0], ast.Expr) and isinstance(getattr(body[0], "value", None), ast.Constant) and isinstance(body[0].value.value, str) else 0
+        node.body = body[:at] + [ast.copy_location(call, body[0])] + body[at:]
+        return node
+
+    visit_AsyncFunctionDef = visit_FunctionDef
 
     def visit_Compare(self, node):
         self.generic_visit(node)
@@ -110,6 +202,8 @@ def install(root, cache):
     _Loader.root, _Loader.cache = root, cache
     os.makedirs(cache, exist_ok=True)
     builtins.__blast_probe__ = _probe
+    builtins.__blast_register__ = _register
+    builtins.__blast_defuse__ = _defuse
     sys.meta_path.insert(0, _Finder())
 
 
@@ -117,9 +211,13 @@ def unsafe_sites():
     return sorted(site for site, pairs in _seen.items() if not all(identity_safe(a, b) for a, b in pairs))
 
 
+def snapshot():
+    return {"unsafe": unsafe_sites(), "masks": {k: v for k, v in _masks.items() if v}, "used": dict(_used)}
+
+
 def dump(path):
     with open(path, "w") as f:
-        json.dump(unsafe_sites(), f)
+        json.dump(snapshot(), f)
 
 
 if __name__ == "__mp_main__" and os.environ.get("BLAST_PROBE_OUT"):
@@ -162,13 +260,21 @@ def main():
 
         code = pytest.main([test["id"], "-q", "-p", "no:cacheprovider", "-p", "no:randomly", "--no-header",
                             "-o", "addopts=", "--timeout=900"])
-        unsafe = set(unsafe_sites())
+        merged = snapshot()
+        unsafe = set(merged["unsafe"])
         for name in os.listdir(parts):
             if name.startswith("worker."):
                 with open(os.path.join(parts, name)) as f:
-                    unsafe.update(json.load(f))
+                    other = json.load(f)
+                unsafe.update(other["unsafe"])
+                for k, v in other["masks"].items():
+                    merged["masks"][k] = merged["masks"].get(k, 0) | v
+                for k, v in other["used"].items():
+                    old = merged["used"].get(k, 0)
+                    merged["used"][k] = -1 if -1 in (old, v) else old | v
+        merged["unsafe"] = sorted(unsafe)
         with open(os.path.join(out_dir, f"probe.{number}.json"), "w") as f:
-            json.dump({"number": number, "outcome": int(code), "unsafe": sorted(unsafe)}, f)
+            json.dump({"number": number, "outcome": int(code), **merged}, f)
 
     # Warm the code cache once so children do not all rewrite the same modules.
     if os.fork() == 0:
