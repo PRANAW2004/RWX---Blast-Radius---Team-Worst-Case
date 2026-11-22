@@ -58,6 +58,58 @@ def _probe(site, op, a, b):
     return result
 
 
+_attrs = set()  # "owner|NAME": ALL_CAPS attributes read, by the class or module defining them
+_CAPS = __import__("re").compile(r"^_*[A-Z][A-Z0-9_]*$")
+_importing = [0]  # > 0 while a sqlglot module executes (import time, incl. metaclasses)
+_runtime_attrs = set()  # the reads made outside any sqlglot module import
+
+
+def _attr(obj, name):
+    value = getattr(obj, name)
+    _resolve(obj, name)
+    if not _importing[0]:
+        _runtime_attrs.update(_last)  # read while running, not while a module loads
+    return value
+
+
+_last = []
+
+
+def _resolve(obj, name):
+    _last.clear()
+    add = lambda key: (_attrs.add(key), _last.append(key))
+    try:
+        if isinstance(obj, super):
+            # super().NAME: resolution starts after __thisclass__ in the instance's MRO.
+            full = obj.__self_class__.__mro__
+            mro = full[full.index(obj.__thisclass__) + 1 :]
+        elif isinstance(obj, type):
+            mro = obj.__mro__
+        elif isinstance(obj, type(sys)):
+            add(f"{obj.__name__}|{name}")
+            return
+        else:
+            if name in getattr(obj, "__dict__", ()):
+                add(f"<instance>|{name}")
+                return
+            mro = type(obj).__mro__
+        for klass in mro:
+            if name in klass.__dict__:
+                add(f"{klass.__module__}:{klass.__qualname__}|{name}")
+                break
+        else:
+            add(f"<unknown>|{name}")  # found some other way: counts for every owner
+    except Exception:
+        add(f"<unknown>|{name}")
+
+
+_lambdas = set()  # lambda sites whose body ran
+
+
+def _lambda(site):
+    _lambdas.add(site)
+
+
 def _register(site):
     def decorate(fn):
         target = fn
@@ -148,6 +200,24 @@ class _Rewriter(ast.NodeTransformer):
 
     visit_AsyncFunctionDef = visit_FunctionDef
 
+    def visit_Lambda(self, node):
+        self.generic_visit(node)
+        site = f"{self.rel}:{node.lineno}:{node.col_offset}"
+        mark = ast.Call(func=ast.Name(id="__blast_lambda__", ctx=ast.Load()), args=[ast.Constant(site)], keywords=[])
+        node.body = ast.copy_location(ast.BoolOp(op=ast.Or(), values=[mark, node.body]), node.body)
+        return node
+
+    def visit_Attribute(self, node):
+        self.generic_visit(node)
+        if isinstance(node.ctx, ast.Load) and _CAPS.match(node.attr):
+            call = ast.Call(
+                func=ast.Name(id="__blast_attr__", ctx=ast.Load()),
+                args=[node.value, ast.Constant(node.attr)],
+                keywords=[],
+            )
+            return ast.copy_location(call, node)
+        return node
+
     def visit_Compare(self, node):
         self.generic_visit(node)
         if len(node.ops) != 1 or type(node.ops[0]) not in OP_IDS:
@@ -164,6 +234,13 @@ class _Rewriter(ast.NodeTransformer):
 class _Loader(importlib.machinery.SourceFileLoader):
     root = None
     cache = None
+
+    def exec_module(self, module):
+        _importing[0] += 1
+        try:
+            super().exec_module(module)
+        finally:
+            _importing[0] -= 1
 
     def get_code(self, fullname):
         path = self.get_filename(fullname)
@@ -204,6 +281,8 @@ def install(root, cache):
     builtins.__blast_probe__ = _probe
     builtins.__blast_register__ = _register
     builtins.__blast_defuse__ = _defuse
+    builtins.__blast_attr__ = _attr
+    builtins.__blast_lambda__ = _lambda
     sys.meta_path.insert(0, _Finder())
 
 
@@ -212,7 +291,8 @@ def unsafe_sites():
 
 
 def snapshot():
-    return {"unsafe": unsafe_sites(), "masks": {k: v for k, v in _masks.items() if v}, "used": dict(_used)}
+    return {"unsafe": unsafe_sites(), "masks": {k: v for k, v in _masks.items() if v}, "used": dict(_used),
+            "attrs": sorted(_attrs), "runtime_attrs": sorted(_runtime_attrs), "lambdas": sorted(_lambdas)}
 
 
 def dump(path):
@@ -269,6 +349,9 @@ def main():
                 unsafe.update(other["unsafe"])
                 for k, v in other["masks"].items():
                     merged["masks"][k] = merged["masks"].get(k, 0) | v
+                merged["attrs"] = sorted(set(merged["attrs"]) | set(other.get("attrs", ())))
+                merged["lambdas"] = sorted(set(merged["lambdas"]) | set(other.get("lambdas", ())))
+                merged["runtime_attrs"] = sorted(set(merged["runtime_attrs"]) | set(other.get("runtime_attrs", ())))
                 for k, v in other["used"].items():
                     old = merged["used"].get(k, 0)
                     merged["used"][k] = -1 if -1 in (old, v) else old | v

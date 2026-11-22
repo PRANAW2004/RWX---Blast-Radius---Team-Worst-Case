@@ -84,6 +84,9 @@ from build_refs import build as build_refs  # noqa: E402
 # identity-safe, i.e. where swapping `is` and `==` could change the result.
 probe_bits, probe_unreliable, probed_files = {}, 0, []
 probe_masks, probe_used = {}, {}
+attr_reads = {}  # "owner|NAME" -> tests that read NAME as defined by owner (class or module)
+lambda_calls = {}  # lambda site -> tests that ran its body
+runtime_reads = {}  # "owner|NAME" -> tests that read it while running (not while a module loads)
 if probe_dir:
     for test in tests:
         number = test["number"]
@@ -101,6 +104,12 @@ if probe_dir:
             for op in range(8):
                 if mask >> op & 1:
                     ops[op] = ops.get(op, 0) | (1 << number)
+        for key in record.get("runtime_attrs", ()):
+            runtime_reads[key] = runtime_reads.get(key, 0) | (1 << number)
+        for site in record.get("lambdas", ()):
+            lambda_calls[site] = lambda_calls.get(site, 0) | (1 << number)
+        for key in record.get("attrs", ()):
+            attr_reads[key] = attr_reads.get(key, 0) | (1 << number)
         for site, mask in record.get("used", {}).items():
             params = probe_used.setdefault(site, {})
             if mask == -1:
@@ -120,6 +129,9 @@ payload = {
     "probe_unreliable": probe_unreliable,
     "probe_masks": {site: {op: intern(b) for op, b in ops.items()} for site, ops in probe_masks.items()},
     "probe_used": {site: {p: intern(b) for p, b in ps.items()} for site, ps in probe_used.items()},
+    "attr_reads": {key: intern(b) for key, b in attr_reads.items()},
+    "lambda_calls": {site: intern(b) for site, b in lambda_calls.items()} if probe_dir else None,
+    "runtime_reads": {key: intern(b) for key, b in runtime_reads.items()} if probe_dir else None,
     "probed_files": probed_files,
     "refs": build_refs(root),
     "count": count,

@@ -71,5 +71,10 @@ def build(root):
                         if id(node) in in_default:
                             refs.setdefault(ident, set()).add((rel, "default") + in_default[id(node)])
                         else:
-                            refs.setdefault(ident, set()).add((rel,) + innermost(spans, node.lineno))
+                            # "attr": `x.NAME`, which run_probes.py records with the class or module
+                            # it was read from; "name" / "str": bare names and string literals,
+                            # which it cannot see.
+                            kind = "attr" if isinstance(node, ast.Attribute) else (
+                                "name" if isinstance(node, ast.Name) else "str")
+                            refs.setdefault(ident, set()).add((rel,) + innermost(spans, node.lineno) + (kind,))
     return {k: sorted(v, key=str) for k, v in refs.items()}

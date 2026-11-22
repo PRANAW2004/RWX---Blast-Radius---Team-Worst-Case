@@ -40,7 +40,7 @@ Then LPT packing for k = 1..8 workers, pick min(max load + 2 s * k).
 
 ## Results on the 30 sample commits
 
-0 misses. Simulated 113.3 s (v1 175.8 -> board 213.0; v2 117.2 -> board 200.5; v3 114.7; this is v4).
+0 misses. Simulated 112.5 s + 1.5 s CPU (v1 175.8 -> board 213.0; v2 117.2 -> 200.5; v4 113.3 -> 179.5; this is v5).
 Perfect-knowledge floor on the samples (only the failing tests, best split) is 94.4 s.
 Selector CPU 0.3 s for 30 commits.
 
@@ -87,6 +87,27 @@ v4 (found with ground truth: realistic mutants labeled by the full suite):
 - Ground truth: 11 realistic mutants, 0 misses, 48.7 s vs perfect 12.2 s. NOTE pytest 9 reports
   subtest failures as `SUBFAILED[...] id` or `SUBFAILED(...) id` beside a PASSED test; parse
   every line starting FAILED/ERROR/SUBFAILED for the tests/... id (see truth labeling).
+
+v5 (soundness fix + precision), probes in mapper/run_probes.py now also record:
+- every `x.NAME` read of an ALL_CAPS attribute, with the class or module NAME was read from
+  (resolved through the MRO, including super()); "<unknown>" when unresolvable (counts for all).
+- every lambda whose body ran.
+SOUNDNESS FIX: v4 limited a class-setting change to tests that instantiate the class. A dialect
+metaclass copies settings into other classes at import (Snowflake.Tokenizer.NUMERIC_ESCAPES ->
+Snowflake.ESCAPED_SEQUENCES, used by the generator), so tests that never instantiate the
+tokenizer can be affected. v5: measured reads from that class, plus (for reads the probes cannot
+attribute: string literals, bare names in the class's own body, test files) every importer of
+the module. Bare names outside the class body cannot read a class attribute and are ignored.
+Class-body `DERIVED = f(NAME)` is followed into DERIVED's reads.
+Lambda-only edits (all differences inside lambda bodies) select only tests that ran the lambda.
+
+v5 also compares import-time state (snapshot.py): the Docker build fingerprints every class
+attribute and module global of sqlglot after loading everything (several hash seeds and
+environment sizes, so order-dependent entries compare unordered and random ones abort). For a
+setting-level change whose run-time readers are much fewer than its readers, the selector loads
+the patched source in a subprocess (~1 s CPU) and keeps only tests that read a changed
+attribute while running (probes tag reads made while a sqlglot module executes as import-time).
+Any changed attribute whose reads are not tracked, any import failure or volatile entry: keep.
 
 ## Verified earlier
 

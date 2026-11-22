@@ -329,6 +329,51 @@ def single_operator_swap(old, new):
     return found
 
 
+def lambda_only_sites(old, new):
+    """If every difference between old and new (a scope's own code: nested defs are
+    compared by name only) lies inside lambda bodies, return the "line:col" sites of the
+    innermost such lambdas in old; else None."""
+    sites = set()
+
+    def walk(o, n, lam, top):
+        if type(o) is not type(n):
+            return record(lam)
+        if isinstance(o, ast.AST):
+            if not top and isinstance(o, DEF_TYPES):
+                return True if o.name == n.name else record(lam)
+            for name, value in ast.iter_fields(o):
+                if name == "type_comment":
+                    continue
+                inner = o if isinstance(o, ast.Lambda) and name == "body" else lam
+                if not walk(value, getattr(n, name, None), inner, False):
+                    return False
+            return True
+        if isinstance(o, list):
+            if len(o) != len(n):
+                return record(lam)
+            return all(walk(x, y, lam, False) for x, y in zip(o, n))
+        return True if (type(o) is type(n) and o == n) else record(lam)
+
+    def record(lam):
+        if lam is None:
+            return False
+        sites.add(f"{lam.lineno}:{lam.col_offset}")
+        return True
+
+    return sites if walk(old, new, None, True) and sites else None
+
+
+def setting_targets(statement):
+    """ALL_CAPS names a class-body statement assigns, if it is a plain assignment."""
+    if isinstance(statement, ast.Assign) and all(isinstance(t, ast.Name) for t in statement.targets):
+        names = [t.id for t in statement.targets]
+    elif isinstance(statement, ast.AnnAssign) and isinstance(statement.target, ast.Name) and statement.value is not None:
+        names = [statement.target.id]
+    else:
+        return None
+    return names if all(SETTING.match(n) for n in names) else None
+
+
 def changed_defaults(old, new):
     """Positions (positional defaults first, then keyword-only ones, as run_probes.py
     numbers them) of parameters whose default value is the only change; else None."""
@@ -507,6 +552,11 @@ def align_blocks(parent, old_body, new_body, ranges):
 def align_statement(old, new, ranges):
     if isinstance(old, DEF_TYPES) or isinstance(new, DEF_TYPES):
         return False
+    sites = lambda_only_sites(old, new)
+    if sites:
+        # Only lambda bodies changed: only tests that call those lambdas.
+        ranges.append(("lambda", sites))
+        return True
     uses = constant_assignment_uses(old, new)
     if uses is not None:
         # The new value matters only to tests that run the assignment AND read the name.
@@ -637,6 +687,9 @@ class Selector:
         self.probed_files = set(data.get("probed_files", ()))
         self.probe_masks = data.get("probe_masks", {})
         self.probe_used = data.get("probe_used", {})
+        self.attr_reads = data.get("attr_reads")
+        self.lambda_calls = data.get("lambda_calls")
+        self.runtime_reads = data.get("runtime_reads")
         self.all = (1 << self.count) - 1
 
     def line_users(self, path, start, end):
@@ -670,12 +723,19 @@ class Selector:
         return self.sets[index] if index is not None else 0
 
     def select(self, patch_text):
+        # Setting-level changes are tracked apart, so the import-state comparison can
+        # replace their contribution; anything else that might break it marks it unusable.
+        self.setting_bits = 0
+        self.setting_keys = []  # (owner, names) of setting-level changes
+        self.setting_ok = True
+        self.patched = {}
         bits = 0
         for change in parse_patch(patch_text):
             try:
                 bits |= self.select_change(change)
             except Exception as error:  # never crash: fall back to everything the file touches
                 log(f"fallback on {change.get('old') or change.get('new')}: {error!r}")
+                self.setting_ok = False
                 path = change.get("old") or change.get("new") or ""
                 bits |= self.importers(path) | self.readers(path) | self.tests_in(path)
                 if not bits:
@@ -693,6 +753,8 @@ class Selector:
         if name in CONFIG_FILES or name == "conftest.py":
             return bits | self.config_change(change)
 
+        if not (old_path == new_path and path.startswith("sqlglot/") and path.endswith(".py")) or change["binary"]:
+            self.setting_ok = False
         if not path.endswith(".py"):
             if old_path is None and new_path is not None:
                 bits |= self.directory_readers(new_path)
@@ -713,7 +775,9 @@ class Selector:
             old_tree = ast.parse(old_source)
             new_tree = ast.parse(new_source)
         except (SyntaxError, ValueError):
+            self.setting_ok = False
             return bits | self.importers(old_path) | self.tests_in(old_path)
+        self.patched[old_path] = new_source
 
         old_scopes, new_scopes = Scopes(old_tree), Scopes(new_tree)
         for scope in changed_scopes(old_scopes, new_scopes, removed, added):
@@ -726,19 +790,30 @@ class Selector:
         node = scopes.nodes[name]
         if name == "" or isinstance(node, ast.Module):
             new_node = new_scopes.nodes.get("") if new_scopes is not None else None
+            sites = lambda_only_sites(node, new_node) if REFINE and new_node is not None else None
+            if sites and path in self.probed_files and self.lambda_calls is not None:
+                return self.lambda_users(path, sites)
             settings = changed_settings(node, new_node) if REFINE and new_node is not None else None
             if settings:
                 # Only ALL_CAPS constants changed value: importers that run code reading them.
-                return self.importers(path) & self.readers_of(settings)
+                result = self.setting_readers(settings, module_name(path), self.importers(path))
+                self.setting_bits |= result
+                self.setting_keys.append((module_name(path), settings))
+                return result
             return self.importers(path)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             new_node = new_scopes.nodes.get(name) if new_scopes is not None else None
+            start_line = node.body[0].lineno if node.body else node.lineno
             if REFINE and isinstance(new_node, type(node)) and header_shape_def(node) == header_shape_def(new_node):
                 ranges = statement_ranges(node, new_node)
                 if ranges is not None:
                     bits = 0
                     for item in ranges:
-                        if item[0] == "&":
+                        if item[0] == "lambda":
+                            if self.lambda_calls is None or path not in self.probed_files:
+                                return self.line_users(path, start_line, node.end_lineno)
+                            bits |= self.lambda_users(path, item[1])
+                        elif item[0] == "&":
                             uses = 0
                             for start, end in item[2]:
                                 uses |= self.line_users(path, start, end)
@@ -780,18 +855,98 @@ class Selector:
         for child in iter_scope_children(node):
             if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) and child.body:
                 bits |= self.line_users(path, child.body[0].lineno, child.end_lineno)
+        new_node = new_scopes.nodes.get(name) if new_scopes is not None else None
+        sites = lambda_only_sites(node, new_node) if REFINE and new_node is not None else None
+        if sites and path in self.probed_files and self.lambda_calls is not None:
+            return self.lambda_users(path, sites)  # only lambda bodies changed: their callers
         index = self.classes.get(key) if key else None
         if index is None or "#" in name:
             return bits | self.importers(path)
         users = self.sets[index]
-        new_node = new_scopes.nodes.get(name) if new_scopes is not None else None
         settings = changed_settings(node, new_node) if REFINE and new_node is not None else None
         if settings:
-            # Only setting values changed: tests that use the class AND run code reading them.
-            return users & self.readers_of(settings)
+            # Only setting values changed: tests that read them from this class (measured), or
+            # that load the class's module and run a read the probes cannot attribute. Not just
+            # the class's users: a metaclass may copy a setting into other classes at import.
+            result = self.setting_readers(settings, key, self.importers(path), node, path)
+            self.setting_bits |= result
+            self.setting_keys.append((key, settings))
+            return result
         return bits | users
 
-    def readers_of(self, names):
+    def untracked_readers(self, name, owner):
+        """Run-time reads of NAME the probes cannot attribute: string literals anywhere, reads
+        in files they do not instrument (tests), bare names inside the owning module (for a
+        module constant), and reads inside default values (via the default-use probes)."""
+        module = owner.split(":")[0]
+        module_path = module.replace(".", "/") + ".py"
+        if module_path not in self.lines:
+            module_path = module.replace(".", "/") + "/__init__.py"
+        importers = self.importers(module_path)
+        bits = 0
+        for ref in self.refs.get(name, ()):
+            if len(ref) == 4 and ref[1] == "default":
+                used = self.probe_used.get(ref[2])
+                if used is None or ref[0] not in self.probed_files:
+                    bits |= self.importers(ref[0])
+                    continue
+                for position in (ref[3], -1):
+                    index = used.get(position)
+                    if index is not None:
+                        bits |= self.sets[index]
+                continue
+            path, start, end = ref[:3]
+            kind = ref[3] if len(ref) == 4 else "str"
+            if kind == "attr" and path in self.probed_files:
+                continue  # attributed by the probes
+            if kind == "name" and (":" in owner or path != module_path):
+                continue  # a bare name cannot read a class attribute or another module's global
+            bits |= self.line_users(path, start, end)
+        return bits & importers
+
+    def lambda_users(self, path, sites):
+        bits = self.probe_unreliable
+        for site in sites:
+            index = self.lambda_calls.get(f"{path}:{site}")
+            if index is not None:
+                bits |= self.sets[index]
+        return bits
+
+    def setting_readers(self, names, owner, users, scope=None, path=None, seen=None):
+        """Tests a change of these ALL_CAPS names, defined by owner (a class key or a module
+        name), can affect. `x.NAME` reads in instrumented files are attributed to the class or
+        module NAME was read from; every other read counts for all of `users`."""
+        if self.attr_reads is None:
+            return users & self.readers_of(names)  # without probes: the older, coarser rule
+        seen = set(names) if seen is None else seen
+        bits = 0
+        for name in names:
+            for key in (f"{owner}|{name}", f"<unknown>|{name}"):
+                index = self.attr_reads.get(key)
+                if index is not None:
+                    bits |= self.sets[index]
+        # A bare-name read in this class's own body that only computes another setting
+        # (DERIVED = f(NAME)) passes the change on to DERIVED: follow it instead.
+        derived, skip = set(), []
+        if isinstance(scope, ast.ClassDef) and path is not None:
+            for statement in scope.body:
+                targets = setting_targets(statement)
+                if not targets:
+                    continue
+                reads = {n.id for n in ast.walk(statement.value) if isinstance(n, ast.Name) and n.id in names}
+                if reads:
+                    skip.append((statement.lineno, statement.end_lineno))
+                    derived.update(t for t in targets if t not in seen)
+        if derived:
+            seen |= derived
+            bits |= self.setting_readers(derived, owner, users, scope, path, seen)
+        # A bare name never reads another class's attribute (in a class body it means that
+        # class's own namespace or a module global), so for a class setting only bare reads in
+        # the class's own body count.
+        own = (path, scope.lineno, scope.end_lineno) if isinstance(scope, ast.ClassDef) and path else None
+        return bits | (users & self.readers_of(names, attributed=True, skip=(path, skip), own_body=own))
+
+    def readers_of(self, names, attributed=False, skip=(None, ()), own_body=None):
         """Tests that execute a statement reading any of these names."""
         readers = 0
         for name in names:
@@ -808,7 +963,15 @@ class Selector:
                         if index is not None:
                             readers |= self.sets[index]
                 else:
-                    ref_path, start, end = ref
+                    ref_path, start, end = ref[:3]
+                    if attributed and len(ref) == 4 and ref[3] == "attr" and ref_path in self.probed_files:
+                        continue  # measured per class / module by the probes
+                    if ref_path == skip[0] and any(a <= start and end <= b for a, b in skip[1]):
+                        continue  # followed into the setting it computes
+                    if own_body is not None and len(ref) == 4 and ref[3] == "name" and not (
+                        ref_path == own_body[0] and own_body[1] <= start and end <= own_body[2]
+                    ):
+                        continue  # a bare name outside the class's body cannot read its attribute
                     readers |= self.line_users(ref_path, start, end)
         return readers
 
@@ -869,6 +1032,106 @@ def read_source(path):
         return None
 
 
+# ---------------------------------------------------------------- import-time state
+
+SNAPSHOT = os.environ.get("BLAST_SNAPSHOT", os.path.join(HERE, "snapshot.pkl"))
+SNAPSHOT_BUDGET = float(os.environ.get("BLAST_SNAPSHOT_BUDGET", "40"))  # CPU seconds for the batch
+SNAPSHOT_COST = 1.3  # CPU seconds for one patched snapshot
+NAMEISH = __import__("re").compile(r"^_*[A-Z][A-Z0-9_]*$")
+
+
+class ImportState:
+    """For setting-level changes, load the patched sqlglot in a subprocess and compare its
+    import-time state with the pinned one (snapshot.py). Effects at import, such as values
+    a metaclass derives, then show up as changed attributes, and only tests that read a
+    changed attribute while running can be affected. Any doubt keeps the selection."""
+
+    def __init__(self):
+        with open(SNAPSHOT, "rb") as f:
+            self.reference = pickle.load(f)
+        self.volatile = set(self.reference.get("<volatile>", ()))
+        self.spent = 0.0
+
+    def refine(self, selector, commit, bits):
+        if not selector.setting_bits or not selector.setting_ok or not selector.patched:
+            return bits
+        others = bits & ~selector.setting_bits
+        # Best case: the change has no effect at import, so only run-time readers of the changed
+        # settings remain. Compare only if that would save more than the comparison costs.
+        best = others
+        for owner, names in selector.setting_keys:
+            for name in names:
+                for probe in (f"{owner}|{name}", f"<unknown>|{name}"):
+                    index = selector.runtime_reads.get(probe)
+                    if index is not None:
+                        best |= selector.sets[index]
+                best |= selector.untracked_readers(name, owner)
+        gain = commit_cost(bits_to_numbers(bits), selector.ms) - commit_cost(bits_to_numbers(best), selector.ms)
+        if gain <= SNAPSHOT_COST + 0.5 or self.spent + SNAPSHOT_COST > SNAPSHOT_BUDGET:
+            return bits
+        changed, used = self.changed_keys(selector.patched)
+        self.spent += used
+        if changed is None:
+            return bits
+        readers = 0
+        for key in changed:
+            owner, name = key.rsplit("|", 1)
+            if not NAMEISH.match(name):
+                log(f"{commit}: import state: {key} changed, its reads are not tracked; keeping selection")
+                return bits
+            for probe in (key, f"<unknown>|{name}"):
+                index = selector.runtime_reads.get(probe)
+                if index is not None:
+                    readers |= selector.sets[index]
+            readers |= selector.untracked_readers(name, owner)
+        log(f"{commit}: import state changed {sorted(changed)[:3]}: {bin(readers).count('1')} readers ({used:.1f} s cpu)")
+        return others | readers | (selector.probe_unreliable & bits)
+
+    def changed_keys(self, patched):
+        import resource
+        import shutil
+        import subprocess
+        import tempfile
+
+        before = resource.getrusage(resource.RUSAGE_CHILDREN)
+        root = tempfile.mkdtemp(prefix="state-", dir=os.environ.get("TMPDIR", "/tmp"))
+        changed = None
+        try:
+            shutil.copytree(os.path.join(SOURCE, "sqlglot"), os.path.join(root, "sqlglot"), copy_function=os.symlink)
+            for path, text in patched.items():
+                target = os.path.join(root, path)
+                os.unlink(target)
+                with open(target, "wb") as f:
+                    f.write(text)
+            keys = os.path.join(root, "unordered.pkl")
+            with open(keys, "wb") as f:
+                pickle.dump(self.reference.get("<unordered>", []), f)
+            out = os.path.join(root, "state.pkl")
+            subprocess.run(
+                [sys.executable, "-S", os.path.join(HERE, "snapshot.py"), root, out, keys],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60, check=True,
+                env={**os.environ, "PYTHONHASHSEED": "3", "PYTHONDONTWRITEBYTECODE": "1"},
+            )
+            with open(out, "rb") as f:
+                state = pickle.load(f)
+            keys = set(self.reference) | set(state)
+            diff = {k for k in keys if not k.startswith("<") and self.reference.get(k) != state.get(k)}
+            failures = {k for k in keys if k.startswith("<import>|") and self.reference.get(k) != state.get(k)}
+            if not (diff & self.volatile) and not failures:
+                changed = diff
+        except Exception as error:  # any doubt keeps the selection
+            log(f"import state error: {error!r}")
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+        after = resource.getrusage(resource.RUSAGE_CHILDREN)
+        return changed, (after.ru_utime + after.ru_stime) - (before.ru_utime + before.ru_stime)
+
+
+def commit_cost(numbers, ms):
+    workers = schedule(numbers, ms)
+    return (max(sum(ms[n] for n in w) for w in workers) + WORKER_MS * len(workers)) / 1000 if workers else 0.0
+
+
 # ---------------------------------------------------------------- scheduling
 
 
@@ -922,6 +1185,7 @@ def main():
                              "sets": [], "lines": {}, "reads": {}, "classes": {}, "test_files": {}})
         selector.select = lambda text: selector.all
     commits = os.path.join(DATA, "commits")
+    snapshots = ImportState() if getattr(selector, "runtime_reads", None) is not None and os.path.exists(SNAPSHOT) else None
     out = []
     total = 0
     for entry in sorted(os.listdir(commits)):
@@ -935,7 +1199,14 @@ def main():
         except Exception as error:
             log(f"{commit}: error {error!r}, running everything")
             bits = selector.all
-        numbers = bits_to_numbers(bits & selector.all)
+            selector.setting_bits = 0
+        bits &= selector.all
+        if snapshots is not None:
+            try:
+                bits = snapshots.refine(selector, commit, bits)
+            except Exception as error:  # any doubt keeps the selection
+                log(f"{commit}: import state error {error!r}")
+        numbers = bits_to_numbers(bits)
         workers = schedule(numbers, selector.ms)
         cost = (max(sum(selector.ms[n] for n in w) for w in workers) + WORKER_MS * len(workers)) if workers else 0
         total += cost

@@ -19,11 +19,15 @@ tar.extractall('/app/src', members=members, filter='data')" \
 
 # The coverage map built from the pinned commit (mapper/ shows how), unpacked
 # here so the run does not pay to decompress it.
-COPY map.pkl.gz selector.py run.py /app/
+COPY map.pkl.gz selector.py run.py snapshot.py /app/
 RUN python -c "import gzip, shutil; shutil.copyfileobj(gzip.open('/app/map.pkl.gz'), open('/app/map.pkl', 'wb'))" \
  && rm /app/map.pkl.gz \
- && python -m compileall -q /app/selector.py \
+ && python -m compileall -q /app/selector.py /app/snapshot.py \
  && chmod -R a+rX /app
+
+# Fingerprint of sqlglot's import-time state at the pinned commit (several runs, to tell
+# order-dependent entries apart), compared at run time against a patched source.
+RUN python -S /app/snapshot.py --reference /app/src /app/snapshot.pkl && chmod a+r /app/snapshot.pkl
 
 ENV BLAST_MAP=/app/map.pkl
 CMD ["python", "-S", "/app/run.py"]
